@@ -1,0 +1,7 @@
+Search indexer based on Solr and SolrJ, built for indexing files within Geodan. 
+
+Usage:
+ Package the application with Maven
+ Edit the config.properties file with your solrURI and paths to crawl
+ Run java -jar indexer.jar
+ Profit!
