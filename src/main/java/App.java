@@ -6,6 +6,8 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Properties;
 
 import org.apache.commons.io.FilenameUtils;
@@ -37,7 +39,7 @@ public class App {
 
     /**
      * Default value to determine whether debug mode is enabled.
-     * This value will be overriden by the set CONFIG_FILE.
+     * This value will be overridden by the set CONFIG_FILE.
      */
     private static final boolean DEFAULT_DEBUG = false;
 
@@ -58,6 +60,9 @@ public class App {
 
     /** Delimiter that is used to serialize a regular string to a Java array. */
     private static final String DELIMITER = "\\|";
+
+    /** Delimiter that is used to find paths to replace. */
+    private static final String REPLACE_DELIMITER = "\\*";
 
     /** Error message when the configuration file couldn't be read. */
     private static final String ERR_CONFIG = "Error: Couldn't read config.properties. (%s)";
@@ -89,6 +94,9 @@ public class App {
     /** Out message when pushing out a file to Solr. */
     private static final String OUT_PUSHING = "Pushing: %s ...";
 
+    /** Out message when replacing a path with another. */
+    private static final String OUT_REPLACE = "Replacing path %s with %s.";
+
     /** Out message when starting the crawl. */
     private static final String OUT_START = "Starting index of: %s";
 
@@ -107,6 +115,9 @@ public class App {
     /** Set paths that will be crawled. */
     private String[] paths;
 
+    /** Paths that need to be replaced, i.e. for Samba crawling. */
+    private HashMap<String, String> pathsToReplace;
+
     /** Set SolrURI that is used to connect to the Solr core. */
     private String solrURI;
 
@@ -122,6 +133,35 @@ public class App {
     }
 
     /**
+     * Replaces paths or part of paths with new values provided in the
+     * configuration file. This can be a useful function when used in
+     * conjunction with Samba shares which are locally mounted.
+     *
+     * If there are no paths given to replace, this will always return
+     * the original path. Otherwise it will try to replace the original
+     * with the given substitute. If there is no substitute found, again
+     * the original path will be returned.
+     *
+     * @param path Path to replace.
+     * @return Either the original path as a String or the (partially)
+     *         replaced path.
+     */
+    private String replacePathFromMap(Path path) {
+        String p = path.toString();
+
+        if (this.pathsToReplace.isEmpty())
+            return p;
+
+        for (Map.Entry<String, String> entry : this.pathsToReplace.entrySet()) {
+            if (p.contains(entry.getKey())) {
+                return p.replace(entry.getKey(), entry.getValue());
+            }
+        }
+
+        return p;
+    }
+
+    /**
      * The actual main method that is also in an instance of this App. This
      * method accepts the properties from the properties file and will start
      * the crawl. This method will crash the application when the Solr URI that
@@ -134,13 +174,14 @@ public class App {
 
         // Check for URI. When the URI is malformed, crash the application with a message.
         try {
-            URI solr = new URI(this.solrURI);
+            new URI(this.solrURI);
         } catch (URISyntaxException e) {
             System.err.print(String.format(App.ERR_GENERIC, e.getMessage()));
             System.exit(0);
         }
 
         for (String str : this.paths) {
+            System.out.println();
             System.out.println(String.format(App.OUT_START, str));
             this.indexPaths(Paths.get(str));
         }
@@ -226,6 +267,19 @@ public class App {
         }
 
         try {
+            this.pathsToReplace = new HashMap<>();
+            for (String path : properties.getProperty("pathsToReplace").split(App.REPLACE_DELIMITER)) {
+                String[] rp = path.split(App.DELIMITER);
+                this.pathsToReplace.put(rp[0], rp[1]);
+                if (this.debug) {
+                    System.out.println(String.format(App.OUT_REPLACE, rp[0], rp[1]));
+                }
+            }
+        } catch (NullPointerException e) {
+            System.err.println(String.format(App.ERR_PROP_MISSING, "pathsToReplace", App.CONFIG_FILE, App.OUT_DEFAULT));
+        }
+
+        try {
             this.paths = properties.getProperty("paths").split(App.DELIMITER);
         } catch (NullPointerException e) {
             System.err.println(String.format(App.ERR_PROP_MISSING, "paths", App.CONFIG_FILE, App.ERR_FATAL));
@@ -274,9 +328,11 @@ public class App {
 
         try {
             up.addFile(path.toFile(), this.contentType);
-            up.setParam("literal.id", path.toString());
+            up.setParam("literal.id", this.replacePathFromMap(path));
             up.setParam("uprefix", "attr_"); // Set the extra metadata
-            up.setParam("fmap.content", "attr_content"); // attr_content is the actual content.
+            up.setParam("fmap.content", "text"); // text is the actual content for free-text search.
+            up.setParam("defaultField", "text");
+
             up.setMethod(SolrRequest.METHOD.POST);
 
             up.setAction(AbstractUpdateRequest.ACTION.COMMIT, true, true);
