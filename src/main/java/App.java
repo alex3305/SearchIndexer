@@ -1,14 +1,9 @@
-import java.io.FileInputStream;
-import java.io.IOException;
+import java.io.*;
 import java.net.URI;
 import java.net.URISyntaxException;
-import java.nio.file.DirectoryStream;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Properties;
+import java.nio.charset.Charset;
+import java.nio.file.*;
+import java.util.*;
 
 import org.apache.commons.io.FilenameUtils;
 import org.apache.solr.client.solrj.SolrRequest;
@@ -28,25 +23,28 @@ import org.apache.solr.client.solrj.request.ContentStreamUpdateRequest;
  */
 public class App {
 
-    /** Static configuration file. Edit to your preferences there. */
-    private static final String CONFIG_FILE = "config.properties";
+    /** Delimiter that is used to serialize a regular string to a Java array. */
+    static final String DELIMITER_SEPERATOR = "\\|";
+
+    /** Delimiter that is used to find paths to replace. */
+    static final String DELIMITER_REPLACE = "\\*";
 
     /**
      * Default Content-Type to send to Solr. Could change when the Solr specs change.
-     * This value will be overriden by the set CONFIG_FILE.
+     * This value will be overriden by the set FILE_CONFIG.
      */
     private static final String DEFAULT_CONTENTTYPE = "application/octet-stream";
 
     /**
      * Default value to determine whether debug mode is enabled.
-     * This value will be overridden by the set CONFIG_FILE.
+     * This value will be overridden by the set FILE_CONFIG.
      */
     private static final boolean DEFAULT_DEBUG = false;
 
     /**
      * Default extensions that are indexed. These include HTML, XML, MsOffice, PDF,
      * TXT, OpenDocument format, RTF and java source files.
-     * This value will be overriden by the set CONFIG_FILE.
+     * This value will be overriden by the set FILE_CONFIG.
      */
     private static final String[] DEFAULT_EXTENSIONS = {"htm", "html", "xml", "doc", "docx", "xls", "xlsx", "ppt",
                                                         "pptx", "pdf", "txt", "odm", "odp", "ods", "odt", "rtf",
@@ -54,24 +52,27 @@ public class App {
 
     /**
      * Default maximum file size that will be send to the Solr instance. Default is 16MB.
-     * This value will be overriden by the set CONFIG_FILE.
+     * This value will be overriden by the set FILE_CONFIG.
      */
     private static final long DEFAULT_MAXFILESIZE = 16777216;
 
-    /** Delimiter that is used to serialize a regular string to a Java array. */
-    private static final String DELIMITER = "\\|";
-
-    /** Delimiter that is used to find paths to replace. */
-    private static final String REPLACE_DELIMITER = "\\*";
-
     /** Error message when the configuration file couldn't be read. */
     private static final String ERR_CONFIG = "Error: Couldn't read config.properties. (%s)";
+
+    /** Error message when there was an IOException while writing to the delta file. */
+    private static final String ERR_DELTA_APPEND = "Error: Couldn't write to delta file (%s).";
+
+    /** Error message when the a delta file couldn't be created. */
+    private static final String ERR_DELTA_CREATE = "Error: Couldn't create delta file (%s).";
 
     /** Error message when a fatal error occurs when a property is missing. */
     private static final String ERR_FATAL = "This value is mandatory for this application.";
 
     /** Error message for generic errors. */
     private static final String ERR_GENERIC = "Error: %s";
+
+    /** Error message when last modified time couldn't be found... */
+    private static final String ERR_LAST_MDO = "Couldn't get last modified time of %s.";
 
     /** Error message when no paths are found to crawl in the configuration. */
     private static final String ERR_NO_PATHS = "Error: No paths found in %s";
@@ -82,6 +83,15 @@ public class App {
     /** Error message when a proprty is missing. */
     private static final String ERR_PROP_MISSING = "Property %s wasn't found in %s. %s";
 
+    /** Static configuration file. Edit to your preferences there. */
+    private static final String FILE_CONFIG = "config.properties";
+
+    /**
+     * File list with last indexed files and last modified time so only
+     * new or changed files will be updated.
+     */
+    private static final String FILE_DELTA = "files.delta";
+
     /** Out message when a default property is used. */
     private static final String OUT_DEFAULT = "Default property will be used.";
 
@@ -90,6 +100,9 @@ public class App {
 
     /** Out message when the indexing is complete. */
     private static final String OUT_FINAL_DONE = "Done indexing the given paths!";
+
+    /** Out message when pushing out a file to Solr. */
+    private static final String OUT_NOT_PUSHING = "Not pushing: %s";
 
     /** Out message when pushing out a file to Solr. */
     private static final String OUT_PUSHING = "Pushing: %s ...";
@@ -105,6 +118,9 @@ public class App {
 
     /** Set value whether debug is enabled. This will be extra verbose. */
     private boolean debug;
+
+    /** List with all the delta files that are known to us */
+    private List<DeltaFile> deltaFileList;
 
     /** Set file extensions that will be crawled */
     private String[] extensions;
@@ -130,6 +146,7 @@ public class App {
         this.debug = App.DEFAULT_DEBUG;
         this.extensions = App.DEFAULT_EXTENSIONS;
         this.maxFileSize = App.DEFAULT_MAXFILESIZE;
+        this.deltaFileList = new ArrayList<>();
     }
 
     /**
@@ -183,6 +200,7 @@ public class App {
         for (String str : this.paths) {
             System.out.println();
             System.out.println(String.format(App.OUT_START, str));
+            this.readDeltaFile();
             this.indexPaths(Paths.get(str));
         }
 
@@ -219,7 +237,9 @@ public class App {
                 } else {
                     for (String ext : this.extensions) {
                         if (ext.equals(FilenameUtils.getExtension(p.toString()).toLowerCase())) {
-                            this.sendToSolr(p);
+                            if (!this.isFileModified(p)) {
+                                this.sendToSolr(p);
+                            }
                         }
                     }
                 }
@@ -227,6 +247,45 @@ public class App {
         } catch (IOException e) {
             System.err.print(String.format(App.ERR_GENERIC, e.getMessage()));
         }
+    }
+
+    /**
+     * Checks whether the provided absolute path has been modified, comparing it
+     * to paths in the delta file that is already known to us.
+     *
+     * @param p Path to check whether it's modified
+     * @return Value to determine whether a path has been modified.
+     */
+    private boolean isFileModified(Path p) {
+        for (DeltaFile delta : this.deltaFileList) {
+            if (p.equals(delta.getPath())) {
+                try {
+                    if (Files.getLastModifiedTime(p).toMillis() == delta.getLastModified().toMillis()) {
+                        if (this.debug) {
+                            System.out.println(String.format(App.OUT_NOT_PUSHING, p.toAbsolutePath()));
+                        }
+
+                        return true;
+                    }
+                } catch (IOException e) {
+                    if (this.debug) {
+                        System.err.println(String.format(App.ERR_LAST_MDO, p.toAbsolutePath()));
+                    }
+                }
+            }
+        }
+
+        try {
+            try (BufferedWriter writer = new BufferedWriter(new FileWriter(App.FILE_DELTA, true))) {
+                writer.append(String.format("%s%s%s",
+                        p.toAbsolutePath(), App.DELIMITER_SEPERATOR, Files.getLastModifiedTime(p).toMillis()));
+                writer.newLine();
+            }
+        } catch (IOException e) {
+            System.err.println(String.format(App.ERR_DELTA_APPEND, App.FILE_DELTA));
+        }
+
+        return false;
     }
 
     /**
@@ -245,62 +304,88 @@ public class App {
         try {
             this.contentType = properties.getProperty("contentType");
         } catch (NullPointerException e) {
-            System.err.println(String.format(App.ERR_PROP_MISSING, "contentType", App.CONFIG_FILE, App.OUT_DEFAULT));
+            System.err.println(String.format(App.ERR_PROP_MISSING, "contentType", App.FILE_CONFIG, App.OUT_DEFAULT));
         }
 
         try {
             this.debug = Boolean.parseBoolean(properties.getProperty("debug"));
         } catch (NullPointerException e) {
-            System.err.println(String.format(App.ERR_PROP_MISSING, "debug", App.CONFIG_FILE, App.OUT_DEFAULT));
+            System.err.println(String.format(App.ERR_PROP_MISSING, "debug", App.FILE_CONFIG, App.OUT_DEFAULT));
         }
 
         try {
-            this.extensions = properties.getProperty("extensions").split(App.DELIMITER);
+            this.extensions = properties.getProperty("extensions").split(App.DELIMITER_SEPERATOR);
         } catch (NullPointerException e) {
-            System.err.println(String.format(App.ERR_PROP_MISSING, "extensions", App.CONFIG_FILE, App.OUT_DEFAULT));
+            System.err.println(String.format(App.ERR_PROP_MISSING, "extensions", App.FILE_CONFIG, App.OUT_DEFAULT));
         }
 
         try {
             this.maxFileSize = Long.parseLong(properties.getProperty("maxFileSize"));
         } catch (NullPointerException e) {
-            System.err.println(String.format(App.ERR_PROP_MISSING, "maxFileSize", App.CONFIG_FILE, App.OUT_DEFAULT));
+            System.err.println(String.format(App.ERR_PROP_MISSING, "maxFileSize", App.FILE_CONFIG, App.OUT_DEFAULT));
         }
 
         try {
             this.pathsToReplace = new HashMap<>();
-            for (String path : properties.getProperty("pathsToReplace").split(App.REPLACE_DELIMITER)) {
-                String[] rp = path.split(App.DELIMITER);
+            for (String path : properties.getProperty("pathsToReplace").split(App.DELIMITER_REPLACE)) {
+                String[] rp = path.split(App.DELIMITER_SEPERATOR);
                 this.pathsToReplace.put(rp[0], rp[1]);
                 if (this.debug) {
                     System.out.println(String.format(App.OUT_REPLACE, rp[0], rp[1]));
                 }
             }
         } catch (NullPointerException e) {
-            System.err.println(String.format(App.ERR_PROP_MISSING, "pathsToReplace", App.CONFIG_FILE, App.OUT_DEFAULT));
+            System.err.println(String.format(App.ERR_PROP_MISSING, "pathsToReplace", App.FILE_CONFIG, App.OUT_DEFAULT));
         }
 
         try {
-            this.paths = properties.getProperty("paths").split(App.DELIMITER);
+            this.paths = properties.getProperty("paths").split(App.DELIMITER_SEPERATOR);
         } catch (NullPointerException e) {
-            System.err.println(String.format(App.ERR_PROP_MISSING, "paths", App.CONFIG_FILE, App.ERR_FATAL));
+            System.err.println(String.format(App.ERR_PROP_MISSING, "paths", App.FILE_CONFIG, App.ERR_FATAL));
             System.exit(0);
         }
 
         try {
             this.solrURI = properties.getProperty("solrURI");
         } catch (NullPointerException e) {
-            System.err.println(String.format(App.ERR_PROP_MISSING, "solrURI", App.CONFIG_FILE, App.ERR_FATAL));
+            System.err.println(String.format(App.ERR_PROP_MISSING, "solrURI", App.FILE_CONFIG, App.ERR_FATAL));
             System.exit(0);
         }
 
         if (this.paths.length == 0) {
-            System.err.println(String.format(App.ERR_NO_PATHS, App.CONFIG_FILE));
+            System.err.println(String.format(App.ERR_NO_PATHS, App.FILE_CONFIG));
             System.exit(0);
         }
 
         if (this.solrURI.equals("")) {
             System.err.println(App.ERR_NO_SOLRURI);
             System.exit(0);
+        }
+    }
+
+    /**
+     * Reads the delta file and creates new objects in memory, which is
+     * faster when parsing paths. This method will append all the found
+     * files to a list.
+     */
+    private void readDeltaFile() {
+        Path deltaFile = Paths.get(App.FILE_DELTA);
+        try (BufferedReader reader = Files.newBufferedReader(deltaFile, Charset.forName("UTF-8"))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                this.deltaFileList.add(new DeltaFile(line));
+            }
+        } catch (IOException exc) {
+            File tmpDelta = deltaFile.toFile();
+            if (!tmpDelta.exists()) {
+                try {
+                    if (!tmpDelta.createNewFile()) {
+                        System.err.println(String.format(App.ERR_DELTA_CREATE, App.FILE_DELTA));
+                    }
+                } catch (IOException e) {
+                    System.err.println(String.format(App.ERR_DELTA_CREATE, App.FILE_DELTA));
+                }
+            }
         }
     }
 
@@ -358,7 +443,7 @@ public class App {
         Properties properties = new Properties();
 
         try {
-            properties.load(new FileInputStream(App.CONFIG_FILE));
+            properties.load(new FileInputStream(App.FILE_CONFIG));
         } catch (Exception e) {
             System.err.print(String.format(App.ERR_CONFIG, e.getMessage()));
             System.exit(0);
