@@ -257,6 +257,8 @@ public class App {
      * @return Value to determine whether a path has been modified.
      */
     private boolean isFileModified(Path p) {
+        boolean isModified = false;
+
         for (DeltaFile delta : this.deltaFileList) {
             if (p.equals(delta.getPath())) {
                 try {
@@ -265,7 +267,7 @@ public class App {
                             System.out.println(String.format(App.OUT_NOT_PUSHING, p.toAbsolutePath()));
                         }
 
-                        return true;
+                        isModified = true;
                     }
                 } catch (IOException e) {
                     if (this.debug) {
@@ -285,7 +287,7 @@ public class App {
             System.err.println(String.format(App.ERR_DELTA_APPEND, App.FILE_DELTA));
         }
 
-        return false;
+        return isModified;
     }
 
     /**
@@ -374,6 +376,15 @@ public class App {
             String line;
             while ((line = reader.readLine()) != null) {
                 this.deltaFileList.add(new DeltaFile(line));
+            }
+
+            // Read whole file? flush it! Otherwise our delta file would grow massively.
+            try {
+                try (BufferedWriter writer = new BufferedWriter(new FileWriter(App.FILE_DELTA, false))) {
+                    writer.write("");
+                }
+            } catch (IOException e) {
+                System.err.println(String.format(App.ERR_DELTA_APPEND, App.FILE_DELTA));
             }
         } catch (IOException exc) {
             File tmpDelta = deltaFile.toFile();
