@@ -319,6 +319,8 @@ public class App {
             this.extensions = properties.getProperty("extensions").split(App.DELIMITER_SEPERATOR);
         } catch (NullPointerException e) {
             System.err.println(String.format(App.ERR_PROP_MISSING, "extensions", App.FILE_CONFIG, App.OUT_DEFAULT));
+        } catch (ArrayIndexOutOfBoundsException e) {
+            // When no extensions are specified this Exception will be thrown. Ignore and continue.
         }
 
         try {
@@ -338,11 +340,16 @@ public class App {
             }
         } catch (NullPointerException e) {
             System.err.println(String.format(App.ERR_PROP_MISSING, "pathsToReplace", App.FILE_CONFIG, App.OUT_DEFAULT));
+        } catch (ArrayIndexOutOfBoundsException e) {
+            // When no paths to replace are specified this Exception will be thrown. Ignore and continue.
         }
 
         try {
             this.paths = properties.getProperty("paths").split(App.DELIMITER_SEPERATOR);
         } catch (NullPointerException e) {
+            System.err.println(String.format(App.ERR_PROP_MISSING, "paths", App.FILE_CONFIG, App.ERR_FATAL));
+            System.exit(0);
+        } catch (ArrayIndexOutOfBoundsException e) {
             System.err.println(String.format(App.ERR_PROP_MISSING, "paths", App.FILE_CONFIG, App.ERR_FATAL));
             System.exit(0);
         }
